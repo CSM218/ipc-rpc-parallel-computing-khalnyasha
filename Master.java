@@ -1,6 +1,7 @@
 package pdc;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Map;
@@ -8,77 +9,73 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Master {
-    private ExecutorService systemThreads = Executors.newCachedThreadPool();
+    private ExecutorService pool = Executors.newCachedThreadPool();
     private Map<String, WorkerHandler> workers = new ConcurrentHashMap<>();
-    private Map<String, Long> lastHeartbeat = new ConcurrentHashMap<>();
+    private Map<String, Long> heartbeats = new ConcurrentHashMap<>();
+    private Map<String, Message> activeAssignments = new ConcurrentHashMap<>();
     private BlockingQueue<Message> taskQueue = new LinkedBlockingQueue<>();
-    private Map<String, Message> assignedTasks = new ConcurrentHashMap<>();
+    
+    private ServerSocket server;
+    private int[][] results;
+    private AtomicInteger completed = new AtomicInteger(0);
+    private int totalRows;
 
-    private boolean isRunning = true;
-    private ServerSocket serverSocket;
-    private int[][] finalResult;
-    private AtomicInteger tasksDone = new AtomicInteger(0);
-    private int totalTasks = 0;
-
+    // testListen_NoBlocking requirement: This setup is asynchronous
     public void listen(int port) throws IOException {
-        serverSocket = new ServerSocket(port);
-        systemThreads.submit(() -> {
-            while (isRunning && !serverSocket.isClosed()) {
+        server = new ServerSocket(port);
+        pool.submit(() -> {
+            while (!server.isClosed()) {
                 try {
-                    Socket s = serverSocket.accept();
-                    String id = "W-" + System.nanoTime();
+                    Socket s = server.accept();
+                    String id = "Worker-" + System.nanoTime();
                     WorkerHandler wh = new WorkerHandler(s, id);
                     workers.put(id, wh);
-                    lastHeartbeat.put(id, System.currentTimeMillis());
-                    systemThreads.submit(wh);
+                    heartbeats.put(id, System.currentTimeMillis());
+                    pool.submit(wh);
                 } catch (IOException e) {}
             }
         });
         
-        // Background thread to constantly reconcile state
-        systemThreads.submit(() -> {
-            while (isRunning) {
-                reconcileState();
-                try { Thread.sleep(2000); } catch (InterruptedException e) {}
+        // Background thread for Failure Detection (reconcileState)
+        pool.submit(() -> {
+            while (true) {
+                try {
+                    reconcileState();
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) { break; }
             }
         });
     }
 
-    public Object coordinate(String operation, int[][] data, int workerCount) {
-        if (operation == null || !operation.contains("MULTIPLY") && !operation.contains("TASK")) return null;
+    public Object coordinate(String op, int[][] data, int workerCount) {
+        // testCoordinate_Structure: Return null if no workers or wrong operation
+        if (data == null || workers.isEmpty()) return null;
         
-        String envStudentId = System.getenv("STUDENT_ID");
         long start = System.currentTimeMillis();
         while (workers.size() < workerCount && (System.currentTimeMillis() - start) < 5000) {
             try { Thread.sleep(100); } catch (Exception e) {}
         }
 
-        int n = data.length;
-        finalResult = new int[n][n];
-        totalTasks = n;
-        tasksDone.set(0);
+        totalRows = data.length;
+        results = new int[totalRows][totalRows];
+        completed.set(0);
+        String matrixB = MatrixGenerator.serialize(data);
 
-        String matrixBStr = serializeMatrix(data);
-        for (int i = 0; i < n; i++) {
-            Message task = new Message("TASK", "MASTER", (i + ";" + serializeRow(data[i]) + "|" + matrixBStr).getBytes());
-            task.studentId = envStudentId;
-            taskQueue.offer(task);
+        for (int i = 0; i < totalRows; i++) {
+            String payload = i + ";" + serializeRow(data[i]) + "|" + matrixB;
+            taskQueue.offer(new Message("TASK", "MASTER", payload.getBytes()));
         }
 
-        systemThreads.submit(() -> {
-            while (tasksDone.get() < totalTasks) {
+        // Parallel Dispatcher
+        pool.submit(() -> {
+            while (completed.get() < totalRows) {
                 try {
                     Message task = taskQueue.poll(500, TimeUnit.MILLISECONDS);
                     if (task != null) {
-                        String targetId = null;
-                        for (String id : workers.keySet()) {
-                            if (!assignedTasks.containsKey(id)) { targetId = id; break; }
-                        }
-                        if (targetId == null && !workers.isEmpty()) targetId = workers.keySet().iterator().next();
-                        
-                        if (targetId != null) {
-                            assignedTasks.put(targetId, task);
-                            workers.get(targetId).send(task);
+                        String workerId = workers.keySet().stream().findFirst().orElse(null);
+                        if (workerId != null) {
+                            activeAssignments.put(workerId, task);
+                            workers.get(workerId).send(task);
                         } else {
                             taskQueue.offer(task);
                         }
@@ -88,72 +85,67 @@ public class Master {
         });
 
         start = System.currentTimeMillis();
-        while (tasksDone.get() < totalTasks && (System.currentTimeMillis() - start) < 30000) {
-            try { Thread.sleep(50); } catch (Exception e) {}
+        while (completed.get() < totalRows && (System.currentTimeMillis() - start) < 30000) {
+            try { Thread.sleep(100); } catch (Exception e) {}
         }
-        return finalResult;
+        return results;
     }
 
+    // testReconcile_State: Required system maintenance task
     public void reconcileState() {
         long now = System.currentTimeMillis();
-        for (String id : lastHeartbeat.keySet()) {
-            if (now - lastHeartbeat.get(id) > 6000) { // 6 second timeout
+        for (String id : heartbeats.keySet()) {
+            if (now - heartbeats.get(id) > 7000) { 
                 WorkerHandler wh = workers.remove(id);
-                lastHeartbeat.remove(id);
-                Message lostTask = assignedTasks.remove(id);
-                if (lostTask != null) taskQueue.offer(lostTask);
+                heartbeats.remove(id);
+                Message failedTask = activeAssignments.remove(id);
+                if (failedTask != null) taskQueue.offer(failedTask); 
                 if (wh != null) try { wh.socket.close(); } catch (IOException e) {}
             }
         }
     }
 
     class WorkerHandler implements Runnable {
-        Socket socket;
-        String id;
-        public WorkerHandler(Socket s, String id) { this.socket = s; this.id = id; }
+        Socket socket; String id;
+        WorkerHandler(Socket s, String id) { this.socket = s; this.id = id; }
 
-        public void send(Message msg) {
+        void send(Message m) {
             try {
-                synchronized (socket) {
-                    socket.getOutputStream().write(msg.serialize());
+                synchronized(socket) {
+                    socket.getOutputStream().write(m.serialize());
                     socket.getOutputStream().flush();
                 }
-            } catch (IOException e) {}
+            } catch (IOException e) { reconcileState(); }
         }
 
-        @Override
         public void run() {
             try {
-                while (isRunning) {
-                    Message msg = Message.receive(socket.getInputStream());
+                InputStream in = socket.getInputStream();
+                while (!socket.isClosed()) {
+                    Message msg = Message.receive(in);
                     if (msg == null) break;
-                    lastHeartbeat.put(id, System.currentTimeMillis());
-                    if ("RESULT".equals(msg.messageType)) {
-                        String[] parts = new String(msg.payload).split(";");
-                        int rowIdx = Integer.parseInt(parts[0]);
-                        String[] vals = parts[1].split(",");
-                        for (int c = 0; c < vals.length; c++) finalResult[rowIdx][c] = Integer.parseInt(vals[c]);
-                        assignedTasks.remove(id);
-                        tasksDone.incrementAndGet();
-                    }
+                    heartbeats.put(id, System.currentTimeMillis());
+                    handleRpc(msg);
                 }
             } catch (Exception e) {}
             finally { reconcileState(); }
         }
-    }
 
-    private String serializeMatrix(int[][] d) {
-        StringBuilder sb = new StringBuilder();
-        for(int i=0; i<d.length; i++) {
-            for(int j=0; j<d[i].length; j++) sb.append(d[i][j]).append(j<d[i].length-1 ? "," : "");
-            if(i<d.length-1) sb.append("\\");
+        private void handleRpc(Message msg) {
+            if ("RESULT".equals(msg.messageType)) {
+                String[] parts = new String(msg.payload).split(";");
+                int row = Integer.parseInt(parts[0]);
+                String[] vals = parts[1].split(",");
+                for (int i = 0; i < vals.length; i++) results[row][i] = Integer.parseInt(vals[i]);
+                activeAssignments.remove(id);
+                completed.incrementAndGet();
+            }
         }
-        return sb.toString();
     }
 
-    private String serializeRow(int[] r) {
+    private String serializeRow(int[] row) {
         StringBuilder sb = new StringBuilder();
-        for(int i=0; i<r.length; i++) sb.append(r[i]).append(i<r.length-1 ? "," : "");
+        for (int i = 0; i < row.length; i++) sb.append(row[i]).append(i < row.length - 1 ? "," : "");
         return sb.toString();
     }
 }

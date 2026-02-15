@@ -3,85 +3,82 @@ package pdc;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 
 public class Worker {
     private Socket socket;
-    private boolean isRunning = false;
-    private String workerId;
-    private String studentId;
-    private final Object lock = new Object();
+    private String id;
     private ExecutorService threadPool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+    private boolean active = false;
 
     public void joinCluster(String host, int port) {
         try {
             socket = new Socket();
-            socket.connect(new InetSocketAddress(host, port), 2000); // 2s timeout
-            isRunning = true;
-            workerId = System.getenv("WORKER_ID") == null ? "W-" + System.nanoTime() : System.getenv("WORKER_ID");
-            studentId = System.getenv("STUDENT_ID") == null ? "Unknown" : System.getenv("STUDENT_ID");
+            socket.connect(new InetSocketAddress(host, port), 2000);
+            active = true;
+            id = System.getenv("WORKER_ID") != null ? System.getenv("WORKER_ID") : "W-" + System.nanoTime();
+            
+            send(new Message("REGISTER", id, null));
 
-            send(new Message("REGISTER", workerId, null));
-
+            // Failure Detection: Active Heartbeat pulse
             new Thread(() -> {
-                while (isRunning) {
+                while (active) {
                     try {
-                        Thread.sleep(2000);
-                        Message hb = new Message("HEARTBEAT", workerId, null);
-                        hb.studentId = studentId;
-                        send(hb);
-                    } catch (Exception e) { break; }
+                        Thread.sleep(3000);
+                        send(new Message("HEARTBEAT", id, null));
+                    } catch (Exception e) { active = false; }
                 }
             }).start();
 
-            while (isRunning) {
-                Message msg = Message.receive(socket.getInputStream());
-                if (msg == null) break;
-                if ("TASK".equals(msg.messageType)) threadPool.submit(() -> process(msg));
+            try (InputStream in = socket.getInputStream()) {
+                while (active) {
+                    Message msg = Message.receive(in);
+                    if (msg == null) break;
+                    handleRpc(msg);
+                }
             }
         } catch (IOException e) {
-            System.out.println("Connection failed, but handling gracefully for Test.");
+            System.err.println("Worker connection failed.");
         }
     }
 
-    private void process(Message msg) {
-        try {
-            String[] parts = new String(msg.payload).split("\\|");
-            String[] header = parts[0].split(";");
-            int rIdx = Integer.parseInt(header[0]);
-            String[] rStr = header[1].split(",");
-            int[] rA = new int[rStr.length];
-            for(int i=0; i<rStr.length; i++) rA[i] = Integer.parseInt(rStr[i]);
-            String[] rowsB = parts[1].split("\\\\");
-            int cols = rowsB[0].split(",").length;
-            int[][] mB = new int[rowsB.length][cols];
-            for(int i=0; i<rowsB.length; i++) {
-                String[] v = rowsB[i].split(",");
-                for(int j=0; j<v.length; j++) mB[i][j] = Integer.parseInt(v[j]);
-            }
-            StringBuilder sb = new StringBuilder().append(rIdx).append(";");
-            for(int j=0; j<cols; j++) {
-                int sum = 0;
-                for(int k=0; k<rA.length; k++) sum += rA[k] * mB[k][j];
-                sb.append(sum).append(j < cols-1 ? "," : "");
-            }
-            Message res = new Message("RESULT", workerId, sb.toString().getBytes());
-            res.studentId = studentId;
-            send(res);
-        } catch (Exception e) {}
+    private void handleRpc(Message msg) {
+        if ("TASK".equals(msg.messageType)) {
+            threadPool.submit(() -> {
+                try {
+                    String[] parts = new String(msg.payload).split("\\|");
+                    int[][] matrixB = MatrixGenerator.parse(parts[1]);
+                    String[] rowHeader = parts[0].split(";");
+                    int rowIdx = Integer.parseInt(rowHeader[0]);
+                    String[] rowVals = rowHeader[1].split(",");
+                    
+                    int[] resRow = new int[matrixB[0].length];
+                    for (int j = 0; j < matrixB[0].length; j++) {
+                        for (int k = 0; k < rowVals.length; k++) {
+                            resRow[j] += Integer.parseInt(rowVals[k]) * matrixB[k][j];
+                        }
+                    }
+                    
+                    StringBuilder sb = new StringBuilder().append(rowIdx).append(";");
+                    for (int i = 0; i < resRow.length; i++) sb.append(resRow[i]).append(i < resRow.length - 1 ? "," : "");
+                    
+                    Message response = new Message("RESULT", id, sb.toString().getBytes());
+                    send(response);
+                } catch (Exception e) {}
+            });
+        }
     }
 
     private void send(Message m) {
-        synchronized (lock) {
-            try {
-                if (socket != null && !socket.isClosed()) {
+        try {
+            synchronized(socket) {
+                if (!socket.isClosed()) {
                     socket.getOutputStream().write(m.serialize());
                     socket.getOutputStream().flush();
                 }
-            } catch (IOException e) {}
-        }
+            }
+        } catch (IOException e) { active = false; }
     }
 
-    public void execute() { System.out.println("Worker engine active."); }
+    public void execute() { System.out.println("Worker thread initiated."); }
 }
