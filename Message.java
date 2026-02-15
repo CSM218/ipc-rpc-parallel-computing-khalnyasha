@@ -1,104 +1,130 @@
 package pdc;
 
-import java.io.*;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 public class Message {
-
-    // --- PUBLIC FIELDS REQUIRED BY AUTOGRADER STATIC ANALYSIS ---
-    public String magic = "CSM218"; 
-    public int version = 1;
-    
-    // Exact names required by the grader
-    public String messageType; 
-    public String studentId;   
-    
-    public String sender;    
+    public String magic;
+    public int version;
+    public String messageType;
+    public String studentId;
     public long timestamp;
-    public byte[] payload;   
+    public byte[] payload;
 
-    public Message() {}
-
-    public Message(String messageType, String sender, byte[] payload) {
-        this.messageType = messageType;
-        this.sender = sender;
-        this.payload = payload;
-        this.studentId = "Unknown";
+    public Message() {
+        this.magic = "CSM218";
+        this.version = 1;
         this.timestamp = System.currentTimeMillis();
     }
 
-    // --- SERIALIZATION (Fixes [serialization] failure) ---
-    public byte[] serialize() {
-        return pack();
+    public Message(String messageType, String studentId, byte[] payload) {
+        this();
+        this.messageType = messageType;
+        this.studentId = studentId;
+        this.payload = payload;
     }
-    
+
     public byte[] pack() {
         try {
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            DataOutputStream dos = new DataOutputStream(bos);
-
-            writeString(dos, magic);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            DataOutputStream dos = new DataOutputStream(baos);
+            
+            byte[] magicBytes = magic != null ? magic.getBytes(StandardCharsets.UTF_8) : new byte[0];
+            dos.writeInt(magicBytes.length);
+            dos.write(magicBytes);
+            
             dos.writeInt(version);
-            writeString(dos, messageType);
-            writeString(dos, studentId); // Fixes [message_format]
-            writeString(dos, sender);
+            
+            byte[] typeBytes = messageType != null ? messageType.getBytes(StandardCharsets.UTF_8) : new byte[0];
+            dos.writeInt(typeBytes.length);
+            dos.write(typeBytes);
+            
+            byte[] senderBytes = studentId != null ? studentId.getBytes(StandardCharsets.UTF_8) : new byte[0];
+            dos.writeInt(senderBytes.length);
+            dos.write(senderBytes);
+            
             dos.writeLong(timestamp);
             
-            if (payload != null) {
-                dos.writeInt(payload.length);
+            int payloadLen = payload != null ? payload.length : 0;
+            dos.writeInt(payloadLen);
+            if (payloadLen > 0) {
                 dos.write(payload);
-            } else {
-                dos.writeInt(0);
             }
+            
             dos.flush();
-            return bos.toByteArray();
-        } catch (IOException e) { return null; }
-    }
-
-    // --- DESERIALIZATION ---
-    public static Message deserialize(byte[] data) {
-        return unpack(data);
+            return baos.toByteArray();
+        } catch (IOException e) {
+            throw new RuntimeException("Pack failed", e);
+        }
     }
 
     public static Message unpack(byte[] data) {
-        if (data == null) return null;
-        return receive(new ByteArrayInputStream(data));
-    }
-
-    public static Message receive(InputStream in) {
+        if (data == null || data.length == 0) return null;
+        
         try {
-            DataInputStream dis = new DataInputStream(in);
-            String m = readString(dis);
-            if (!"CSM218".equals(m)) return null;
-
+            ByteArrayInputStream bais = new ByteArrayInputStream(data);
+            DataInputStream dis = new DataInputStream(bais);
+            
             Message msg = new Message();
-            msg.magic = m;
-            msg.version = dis.readInt();
-            msg.messageType = readString(dis);
-            msg.studentId = readString(dis);
-            msg.sender = readString(dis);
-            msg.timestamp = dis.readLong();
-
-            int len = dis.readInt();
-            if (len > 0) {
-                msg.payload = new byte[len];
-                dis.readFully(msg.payload); // Fixes [hidden_jumbo_payload]
+            
+            int magicLen = dis.readInt();
+            if (magicLen > 0) {
+                byte[] magicBytes = new byte[magicLen];
+                dis.readFully(magicBytes);
+                msg.magic = new String(magicBytes, StandardCharsets.UTF_8);
             }
+            
+            msg.version = dis.readInt();
+            
+            int typeLen = dis.readInt();
+            if (typeLen > 0) {
+                byte[] typeBytes = new byte[typeLen];
+                dis.readFully(typeBytes);
+                msg.messageType = new String(typeBytes, StandardCharsets.UTF_8);
+            }
+            
+            int senderLen = dis.readInt();
+            if (senderLen > 0) {
+                byte[] senderBytes = new byte[senderLen];
+                dis.readFully(senderBytes);
+                msg.studentId = new String(senderBytes, StandardCharsets.UTF_8);
+            }
+            
+            msg.timestamp = dis.readLong();
+            
+            int payloadLen = dis.readInt();
+            if (payloadLen > 0) {
+                msg.payload = new byte[payloadLen];
+                dis.readFully(msg.payload);
+            }
+            
             return msg;
-        } catch (IOException e) { return null; }
+        } catch (IOException e) {
+            return null;
+        }
     }
 
-    private void writeString(DataOutputStream dos, String s) throws IOException {
-        if (s == null) s = "";
-        byte[] b = s.getBytes(StandardCharsets.UTF_8);
-        dos.writeInt(b.length);
-        dos.write(b);
+    public void validate() throws IllegalStateException {
+        if (!"CSM218".equals(magic)) {
+            throw new IllegalStateException("Invalid magic: " + magic);
+        }
+        if (version != 1) {
+            throw new IllegalStateException("Unsupported version: " + version);
+        }
+        if (messageType == null || messageType.isEmpty()) {
+            throw new IllegalStateException("Message type required");
+        }
     }
 
-    private static String readString(DataInputStream dis) throws IOException {
-        int len = dis.readInt();
-        byte[] b = new byte[len];
-        dis.readFully(b);
-        return new String(b, StandardCharsets.UTF_8);
+    public String getPayloadAsString() {
+        return payload != null ? new String(payload, StandardCharsets.UTF_8) : "";
+    }
+
+    public void setPayloadFromString(String str) {
+        this.payload = str != null ? str.getBytes(StandardCharsets.UTF_8) : null;
     }
 }

@@ -1,143 +1,286 @@
 package pdc;
 
-import java.io.*;
-import java.net.InetSocketAddress;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.net.Socket;
+import java.net.SocketException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Worker {
 
-    private Socket socket;
-    private boolean isRunning = false;
     private String workerId;
-    private String studentId;
-    private final Object lock = new Object();
-    private ExecutorService threadPool;
+    private Socket socket;
+    private DataInputStream in;
+    private DataOutputStream out;
+    private final ExecutorService taskPool;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private String runtimeToken;
+    private static final int BUFFER_SIZE = 65536;
+    private final Object sendLock = new Object();
 
     public Worker() {
-        // [CONCURRENCY] Use thread pool for calculations
+        this.workerId = System.getenv("WORKER_ID");
+        if (this.workerId == null) {
+            this.workerId = "worker-" + System.currentTimeMillis();
+        }
         int cores = Runtime.getRuntime().availableProcessors();
-        this.threadPool = Executors.newFixedThreadPool(cores);
+        this.taskPool = new ThreadPoolExecutor(cores, cores * 2, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(100), new ThreadPoolExecutor.CallerRunsPolicy());
+    }
+
+    public Worker(String workerId) {
+        this();
+        this.workerId = workerId;
     }
 
     public void joinCluster(String masterHost, int port) {
         try {
-            socket = new Socket();
-            // Connect with timeout
-            socket.connect(new InetSocketAddress(masterHost, port), 2000);
-            
-            isRunning = true;
+            socket = new Socket(masterHost, port);
+            socket.setTcpNoDelay(true);
+            socket.setSendBufferSize(BUFFER_SIZE);
+            socket.setReceiveBufferSize(BUFFER_SIZE);
+            socket.setSoTimeout(30000);
 
-            // [ENVIRONMENT_VARIABLES] - Check env vars as required
-            workerId = System.getenv("WORKER_ID");
-            if (workerId == null) workerId = "Worker-" + System.nanoTime();
-            
-            studentId = System.getenv("STUDENT_ID");
-            if (studentId == null) studentId = "Unknown";
+            in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), BUFFER_SIZE));
+            out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), BUFFER_SIZE));
 
-            // Register
-            Message reg = new Message("REGISTER", workerId, null);
-            reg.studentId = studentId;
-            send(reg);
+            Message connect = new Message("CONNECT", workerId, null);
+            connect.setPayloadFromString("INIT");
+            sendMessage(connect);
 
-            // [WORKER_FAILURE_DETECTION] - Heartbeat Thread
-            // Sends a pulse every 2 seconds to prove we are alive
-            new Thread(() -> {
-                while (isRunning && !socket.isClosed()) {
-                    try {
-                        Thread.sleep(2000);
-                        Message hb = new Message("HEARTBEAT", workerId, null);
-                        hb.studentId = studentId;
-                        send(hb);
-                    } catch (Exception e) { 
-                        break; 
-                    }
-                }
-            }).start();
+            Message reg = new Message("REGISTER_WORKER", workerId, null);
+            reg.setPayloadFromString("cores=" + Runtime.getRuntime().availableProcessors());
+            sendMessage(reg);
 
-            // Main Listen Loop
-            InputStream in = socket.getInputStream();
-            while (isRunning && !socket.isClosed()) {
-                Message msg = Message.receive(in);
-                if (msg == null) break;
-
-                // [RPC_ABSTRACTION] - Delegate to handler
-                handleRpc(msg);
+            Message ack = receiveMessage();
+            if (ack != null && "WORKER_ACK".equals(ack.messageType)) {
+                runtimeToken = ack.getPayloadAsString();
+                running.set(true);
+                System.out.println("[" + workerId + "] Registered with master, token: " + runtimeToken);
             }
+
+            Message caps = new Message("REGISTER_CAPABILITIES", workerId, null);
+            caps.setPayloadFromString("MATRIX_MULTIPLY,BLOCK_MULTIPLY,SUM");
+            sendMessage(caps);
+
         } catch (IOException e) {
-            // System.out.println("Connection failed: " + e.getMessage());
+            System.err.println("[" + workerId + "] Failed to join cluster: " + e.getMessage());
         }
     }
 
-    private void handleRpc(Message msg) {
-        if ("TASK".equals(msg.messageType)) {
-            threadPool.submit(() -> processTask(msg));
-        } 
-    }
-
-    private void processTask(Message msg) {
-        try {
-            // Parse payload: "RowIndex;RowData|MatrixB"
-            String text = new String(msg.payload);
-            String[] parts = text.split("\\|");
-            
-            String[] header = parts[0].split(";");
-            int rowIndex = Integer.parseInt(header[0]);
-            String[] rowStr = header[1].split(",");
-            
-            int[] rowA = new int[rowStr.length];
-            for(int i=0; i<rowStr.length; i++) rowA[i] = Integer.parseInt(rowStr[i]);
-
-            String[] rowsB = parts[1].split("\\\\");
-            int cols = rowsB[0].split(",").length;
-            int[][] matrixB = new int[rowsB.length][cols];
-            
-            for(int i=0; i<rowsB.length; i++) {
-                String[] vals = rowsB[i].split(",");
-                for(int j=0; j<vals.length; j++) {
-                    matrixB[i][j] = Integer.parseInt(vals[j]);
-                }
-            }
-
-            // Calculation
-            int[] resultRow = new int[cols];
-            for(int j=0; j<cols; j++) {
-                int sum = 0;
-                for(int k=0; k<rowA.length; k++) {
-                    sum += rowA[k] * matrixB[k][j];
-                }
-                resultRow[j] = sum;
-            }
-
-            // Serialize Result
-            StringBuilder sb = new StringBuilder();
-            sb.append(rowIndex).append(";");
-            for(int i=0; i<resultRow.length; i++) {
-                sb.append(resultRow[i]).append(i < resultRow.length-1 ? "," : "");
-            }
-
-            Message res = new Message("RESULT", workerId, sb.toString().getBytes());
-            res.studentId = studentId;
-            send(res);
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void send(Message msg) {
-        synchronized (lock) {
+    public void execute() {
+        while (running.get()) {
             try {
-                if(socket != null && !socket.isClosed()) {
-                    socket.getOutputStream().write(msg.serialize());
-                    socket.getOutputStream().flush();
+                Message request = receiveMessage();
+                if (request == null) {
+                    running.set(false);
+                    break;
                 }
-            } catch (IOException e) {
-                isRunning = false; // Stop on error
+
+                switch (request.messageType) {
+                    case "HEARTBEAT":
+                        Message hbAck = new Message("HEARTBEAT", workerId, null);
+                        hbAck.setPayloadFromString("ACK");
+                        sendMessage(hbAck);
+                        break;
+
+                    case "RPC_REQUEST":
+                        handleTask(request);
+                        break;
+
+                    case "SHUTDOWN":
+                        running.set(false);
+                        break;
+
+                    default:
+                        break;
+                }
+            } catch (SocketException e) {
+                running.set(false);
+            } catch (Exception e) {
+                if (running.get()) {
+                    System.err.println("[" + workerId + "] Error in execute loop: " + e.getMessage());
+                }
+                running.set(false);
             }
+        }
+        shutdown();
+    }
+
+    private void handleTask(Message request) {
+        taskPool.submit(() -> {
+            String taskId = "";
+            try {
+                String payloadStr = request.getPayloadAsString();
+                int firstPipe = payloadStr.indexOf('|');
+                int secondPipe = payloadStr.indexOf('|', firstPipe + 1);
+
+                taskId = firstPipe > 0 ? payloadStr.substring(0, firstPipe) : "";
+                String taskType = secondPipe > firstPipe ? payloadStr.substring(firstPipe + 1, secondPipe) : "";
+                String matrixData = secondPipe > 0 ? payloadStr.substring(secondPipe + 1) : "";
+
+                String result = processMatrix(taskType, matrixData);
+
+                Message response = new Message("TASK_COMPLETE", workerId, null);
+                response.setPayloadFromString(taskId + "|" + result);
+                sendMessage(response);
+            } catch (Exception e) {
+                try {
+                    Message error = new Message("TASK_ERROR", workerId, null);
+                    error.setPayloadFromString(taskId + "|" + e.getMessage());
+                    sendMessage(error);
+                } catch (Exception ignored) {}
+            }
+        });
+    }
+
+    private String processMatrix(String taskType, String data) {
+        int hashIdx = data.indexOf("#;");
+        if (hashIdx == -1) return data;
+
+        String partA = data.substring(0, hashIdx);
+        String partB = data.substring(hashIdx + 2);
+
+        int[][] matA = parseMatrixFast(partA);
+        int[][] matB = parseMatrixFast(partB);
+
+        if (matA.length == 0 || matB.length == 0) return data;
+
+        int[][] result = multiplyOptimized(matA, matB);
+        return matrixToStringFast(result);
+    }
+
+    private int[][] parseMatrixFast(String str) {
+        if (str == null || str.isEmpty()) return new int[0][0];
+
+        int rowCount = 1;
+        for (int i = 0; i < str.length(); i++) {
+            if (str.charAt(i) == ';') rowCount++;
+        }
+        if (str.endsWith(";")) rowCount--;
+
+        String[] rows = str.split(";");
+        int[][] mat = new int[rows.length][];
+
+        for (int i = 0; i < rows.length; i++) {
+            String row = rows[i];
+            if (row.isEmpty()) {
+                mat[i] = new int[0];
+                continue;
+            }
+
+            int colCount = 1;
+            for (int j = 0; j < row.length(); j++) {
+                if (row.charAt(j) == ',') colCount++;
+            }
+
+            mat[i] = new int[colCount];
+            int col = 0;
+            int num = 0;
+            boolean negative = false;
+            for (int j = 0; j <= row.length(); j++) {
+                char c = j < row.length() ? row.charAt(j) : ',';
+                if (c == '-') {
+                    negative = true;
+                } else if (c >= '0' && c <= '9') {
+                    num = num * 10 + (c - '0');
+                } else if (c == ',' || j == row.length()) {
+                    mat[i][col++] = negative ? -num : num;
+                    num = 0;
+                    negative = false;
+                }
+            }
+        }
+        return mat;
+    }
+
+    private int[][] multiplyOptimized(int[][] a, int[][] b) {
+        int rowsA = a.length;
+        int colsA = a[0].length;
+        int colsB = b[0].length;
+        int[][] c = new int[rowsA][colsB];
+
+        int[][] bT = new int[colsB][colsA];
+        for (int i = 0; i < colsA; i++) {
+            for (int j = 0; j < colsB; j++) {
+                bT[j][i] = b[i][j];
+            }
+        }
+
+        for (int i = 0; i < rowsA; i++) {
+            int[] rowA = a[i];
+            int[] rowC = c[i];
+            for (int j = 0; j < colsB; j++) {
+                int[] colB = bT[j];
+                int sum = 0;
+                for (int k = 0; k < colsA; k++) {
+                    sum += rowA[k] * colB[k];
+                }
+                rowC[j] = sum;
+            }
+        }
+        return c;
+    }
+
+    private String matrixToStringFast(int[][] mat) {
+        StringBuilder sb = new StringBuilder(mat.length * mat[0].length * 4);
+        for (int i = 0; i < mat.length; i++) {
+            int[] row = mat[i];
+            for (int j = 0; j < row.length; j++) {
+                sb.append(row[j]);
+                if (j < row.length - 1) sb.append(',');
+            }
+            if (i < mat.length - 1) sb.append(';');
+        }
+        return sb.toString();
+    }
+
+    private void sendMessage(Message msg) throws IOException {
+        synchronized (sendLock) {
+            byte[] data = msg.pack();
+            out.writeInt(data.length);
+            out.write(data);
+            out.flush();
         }
     }
 
-    public void execute() {}
+    private Message receiveMessage() throws IOException {
+        int len = in.readInt();
+        if (len <= 0 || len > 100_000_000) return null;
+        byte[] data = new byte[len];
+        in.readFully(data);
+        return Message.unpack(data);
+    }
+
+    public void shutdown() {
+        running.set(false);
+        taskPool.shutdownNow();
+        try {
+            if (socket != null && !socket.isClosed()) socket.close();
+        } catch (IOException ignored) {}
+    }
+
+    public boolean isRunning() {
+        return running.get();
+    }
+
+    public static void main(String[] args) {
+        String host = System.getenv("MASTER_HOST");
+        String portStr = System.getenv("MASTER_PORT");
+        if (host == null) host = "localhost";
+        int port = portStr != null ? Integer.parseInt(portStr) : 9999;
+
+        Worker w = new Worker();
+        w.joinCluster(host, port);
+        w.execute();
+    }
 }
