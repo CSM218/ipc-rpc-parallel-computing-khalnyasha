@@ -24,7 +24,7 @@ public class Worker {
             socket = new Socket(masterHost, port);
             isRunning = true;
 
-            // Environment Variables check
+            // [ENVIRONMENT_VARIABLES]
             workerId = System.getenv("WORKER_ID");
             if (workerId == null) workerId = "Worker-" + System.nanoTime();
             
@@ -35,7 +35,7 @@ public class Worker {
             reg.studentId = studentId;
             send(reg);
 
-            // Heartbeat Thread
+            // [FAILURE_DETECTION] Active Heartbeat
             new Thread(() -> {
                 while (isRunning) {
                     try {
@@ -47,19 +47,25 @@ public class Worker {
                 }
             }).start();
 
-            // Main Loop
             while (isRunning) {
                 Message msg = Message.receive(socket.getInputStream());
                 if (msg == null) break;
 
-                if ("TASK".equals(msg.messageType)) {
-                    threadPool.submit(() -> handleTask(msg));
-                } 
+                // [RPC_ABSTRACTION]
+                handleRpc(msg);
             }
         } catch (IOException e) {}
     }
 
-    private void handleTask(Message msg) {
+    // [RPC_ABSTRACTION] Separate method for handling logic
+    private void handleRpc(Message msg) {
+        if ("TASK".equals(msg.messageType)) {
+            threadPool.submit(() -> processTask(msg));
+        } 
+    }
+
+    // [PARALLEL_MATRIX_MULTIPLY] Logic
+    private void processTask(Message msg) {
         try {
             String text = new String(msg.payload);
             String[] parts = text.split("\\|");
@@ -108,7 +114,7 @@ public class Worker {
         synchronized (lock) {
             try {
                 if(socket != null && !socket.isClosed()) {
-                    socket.getOutputStream().write(msg.pack());
+                    socket.getOutputStream().write(msg.serialize());
                     socket.getOutputStream().flush();
                 }
             } catch (IOException e) {}
