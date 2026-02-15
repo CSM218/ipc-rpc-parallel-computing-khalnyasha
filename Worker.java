@@ -24,20 +24,18 @@ public class Worker {
             socket = new Socket(masterHost, port);
             isRunning = true;
 
-            // 1. GET ID FROM ENVIRONMENT (Autograder wants this!)
+            // Environment Variables check
             workerId = System.getenv("WORKER_ID");
-            if (workerId == null) workerId = "Worker-" + (int)(Math.random() * 10000);
+            if (workerId == null) workerId = "Worker-" + System.nanoTime();
             
             studentId = System.getenv("STUDENT_ID");
             if (studentId == null) studentId = "Unknown";
 
-            // 2. REGISTER
             Message reg = new Message("REGISTER", workerId, null);
             reg.studentId = studentId;
             send(reg);
-            System.out.println("Worker " + workerId + " joined.");
 
-            // 3. START HEARTBEAT THREAD (Pulse every 2 seconds)
+            // Heartbeat Thread
             new Thread(() -> {
                 while (isRunning) {
                     try {
@@ -45,13 +43,11 @@ public class Worker {
                         Message hb = new Message("HEARTBEAT", workerId, null);
                         hb.studentId = studentId;
                         send(hb);
-                    } catch (Exception e) {
-                        break;
-                    }
+                    } catch (Exception e) { break; }
                 }
             }).start();
 
-            // 4. LISTEN LOOP
+            // Main Loop
             while (isRunning) {
                 Message msg = Message.receive(socket.getInputStream());
                 if (msg == null) break;
@@ -60,10 +56,7 @@ public class Worker {
                     threadPool.submit(() -> handleTask(msg));
                 } 
             }
-
-        } catch (IOException e) {
-            System.out.println("Worker error: " + e.getMessage());
-        }
+        } catch (IOException e) {}
     }
 
     private void handleTask(Message msg) {
@@ -108,19 +101,17 @@ public class Worker {
             res.studentId = studentId;
             send(res);
 
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        } catch (Exception e) {}
     }
 
     private void send(Message msg) {
         synchronized (lock) {
             try {
-                if(!socket.isClosed()) {
+                if(socket != null && !socket.isClosed()) {
                     socket.getOutputStream().write(msg.pack());
                     socket.getOutputStream().flush();
                 }
-            } catch (IOException e) { }
+            } catch (IOException e) {}
         }
     }
 
